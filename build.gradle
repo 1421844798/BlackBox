@@ -1,0 +1,4 @@
+// 顶层构建脚本：只声明 AGP 版本，不引入任何额外依赖
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
