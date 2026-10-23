@@ -1,0 +1,107 @@
+name: 发布时同步 version.json
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出发布标签，读出这个版本的号
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 1
+
+      - name: 从 build.gradle 读 versionCode / versionName
+        id: v
+        run: |
+          set -e
+          CODE=$(grep -oP 'versionCode\s+\K[0-9]+' app/build.gradle)
+          NAME=$(grep -oP 'versionName\s+"\K[^"]+' app/build.gradle)
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "读到 versionCode=$CODE versionName=$NAME"
+
+      - name: 从 Release 附件里找 APK
+        id: a
+        env:
+          ASSETS: ${{ toJson(github.event.release.assets) }}
+          VNAME: ${{ steps.v.outputs.name }}
+        run: |
+          set -e
+          ALL=$(echo "$ASSETS" | jq -r '.[].name' | grep -Ei '\.apk$' || true)
+          if [ -z "$ALL" ]; then
+            echo "::error::这个 Release 里没有 APK 附件，无法生成清单"
+            exit 1
+          fi
+          PICK=$(echo "$ALL" | grep -F "$VNAME" | head -1 || true)
+          if [ -z "$PICK" ]; then
+            echo "::error::附件里没有名字含 $VNAME 的 APK"
+            echo "::error::现有附件：$(echo "$ALL" | tr '\n' ' ')"
+            echo "::error::请把 APK 改名为 splashskip-$VNAME.apk 后重新发布"
+            exit 1
+          fi
+          COUNT=$(echo "$ALL" | wc -l)
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::warning::这个 Release 有 $COUNT 个 APK，本次只写 $PICK"
+            echo "$ALL" | grep -vF "$PICK" | sed 's/^/::warning::多余附件：/'
+          fi
+          echo "apk=$PICK" >> "$GITHUB_OUTPUT"
+          echo "选定附件：$PICK（共 $COUNT 个）"
+
+      - name: 切回 main 准备提交
+        run: |
+          set -e
+          git fetch origin main
+          git checkout main
+
+      - name: 写入 version.json
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+          CODE: ${{ steps.v.outputs.code }}
+          NAME: ${{ steps.v.outputs.name }}
+          APK: ${{ steps.a.outputs.apk }}
+          RNAME: ${{ github.event.release.name }}
+        run: |
+          set -e
+          NOTES=${RNAME:-"发布 $TAG"}
+          cat > version.json <<EOF
+          {
+            "versionCode": $CODE,
+            "versionName": "$NAME",
+            "apk": "https://github.com/$REPO/releases/download/$TAG/$APK",
+            "notes": "$NOTES",
+            "force": false
+          }
+          EOF
+          echo "--- 新清单 ---"
+          cat version.json
+
+      - name: 提交并推送
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if git diff --cached --quiet; then
+            echo "清单没有变化，跳过提交"
+            exit 0
+          fi
+          git commit -m "chore: 发布 $TAG 时同步 version.json"
+          git push origin main
+
+      - name: 清 jsDelivr 缓存
+        continue-on-error: true
+        run: |
+          # jsDelivr 对 @main 这类分支引用缓存约 12 小时，
+          # 不清的话刚发的新版本在客户端要等半天才能查到。
+          curl -fsS "https://purge.jsdelivr.net/gh/${{ github.repository }}@main/version.json"
+          echo "已请求刷新 CDN 缓存"
